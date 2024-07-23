@@ -1,15 +1,10 @@
-use std::net::Ipv4Addr;
-
 use anyhow::Context;
-use aya::maps::RingBuf;
 use aya::programs::{SockOps, Xdp, XdpFlags};
 use aya::{include_bytes_aligned, Bpf};
 use aya_log::BpfLogger;
 use clap::Parser;
 use log::{debug, info, warn};
-use tcpsynacklat_common::{PacketDirection, TcpHandshakeEvent};
-use tokio::io::unix::AsyncFd;
-use tokio::{signal, task};
+use tokio::signal;
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -61,39 +56,6 @@ async fn main() -> Result<(), anyhow::Error> {
     let cgroup = std::fs::File::open(opt.cgroup_path)?;
     program.load()?;
     program.attach(cgroup)?;
-
-    task::spawn(async move {
-        let map = bpf.map_mut("TCPHSEVENTS").unwrap();
-        let ring_buf = RingBuf::try_from(map)?;
-        let mut async_ring_buf = AsyncFd::new(ring_buf)?;
-
-        loop {
-            let mut guard = async_ring_buf.readable_mut().await?;
-            let entry = guard.get_inner_mut();
-            while let Some(event) = entry.next() {
-                let event_ptr = event.as_ptr() as *const TcpHandshakeEvent;
-                let event = unsafe { event_ptr.read_unaligned() };
-
-                debug!(
-                    "{}, peer {}:{}, local {}:{}, syn seq {}",
-                    match event.direction {
-                        PacketDirection::TX => "Sent SYN",
-                        PacketDirection::RX => "Received SYN-ACK",
-                    },
-                    Ipv4Addr::from(event.key.peer_addr),
-                    event.key.peer_port,
-                    Ipv4Addr::from(event.key.local_addr),
-                    event.key.local_port,
-                    event.key.syn_seq
-                );
-            }
-
-            guard.clear_ready();
-        }
-
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
-    });
 
     info!("Waiting for Ctrl-C...");
     signal::ctrl_c().await?;

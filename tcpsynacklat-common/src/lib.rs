@@ -23,3 +23,5 @@ pub struct TcpHandshakeEvent {
     pub key: TcpHandshakeKey,
     pub direction: PacketDirection,
 }
+
+pub const DIST_BUCKET_SIZE: u32 = 64;

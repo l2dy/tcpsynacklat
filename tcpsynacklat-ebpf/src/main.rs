@@ -2,13 +2,15 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{xdp_action, BPF_SOCK_OPS_TIMEOUT_INIT, BPF_TCP_SYN_SENT},
+    bindings::{xdp_action, BPF_NOEXIST, BPF_SOCK_OPS_TIMEOUT_INIT, BPF_TCP_SYN_SENT},
+    helpers::bpf_ktime_get_ns,
     macros::{map, sock_ops, xdp},
-    maps::{Array, LruHashMap, RingBuf},
+    maps::{LruHashMap, PerCpuArray},
     programs::{SockOpsContext, XdpContext},
 };
-use aya_log_ebpf::warn;
-use tcpsynacklat_common::{PacketDirection, TcpHandshakeEvent, TcpHandshakeKey};
+use aya_log_ebpf::{error, warn};
+use tcpsynacklat_common::{PacketDirection, TcpHandshakeEvent, TcpHandshakeKey, DIST_BUCKET_SIZE};
+use tcpsynacklat_ebpf::bpf_log2l;
 
 use core::mem;
 use network_types::{
@@ -22,10 +24,7 @@ use network_types::{
 static START: LruHashMap<TcpHandshakeKey, u64> = LruHashMap::with_max_entries(1 << 14, 0);
 
 #[map]
-static DIST: Array<u64> = Array::with_max_entries(64, 0); // histogram bucket size
-
-#[map]
-static TCPHSEVENTS: RingBuf = RingBuf::with_byte_size(1 << 14, 0); // 1 * 16 KiB page size
+static DIST: PerCpuArray<u64> = PerCpuArray::with_max_entries(DIST_BUCKET_SIZE, 0);
 
 #[xdp]
 pub fn probe_tcp_synack(ctx: XdpContext) -> u32 {
@@ -65,6 +64,8 @@ fn try_probe_tcp_synack(ctx: XdpContext) -> Result<u32, ()> {
         _ => return Ok(xdp_action::XDP_PASS),
     };
 
+    let ts = unsafe { bpf_ktime_get_ns() };
+
     let event = TcpHandshakeEvent {
         key: TcpHandshakeKey {
             peer_addr: source_addr,
@@ -76,9 +77,28 @@ fn try_probe_tcp_synack(ctx: XdpContext) -> Result<u32, ()> {
         direction: PacketDirection::RX,
     };
 
-    if let Err(_) = TCPHSEVENTS.output(&event, 0) {
-        warn!(&ctx, "ring buffer is full");
-        return Ok(xdp_action::XDP_PASS);
+    // Match SYN packet with 4-tuple and ack number.
+    if let Some(start_ts) = unsafe { START.get(&event.key) } {
+        let latency = ts - start_ts;
+
+        if let Err(errno) = START.remove(&event.key) {
+            error!(&ctx, "Unable to remove key from hash map, error {}", errno)
+        }
+
+        // If SYN packet is older than 2*MSL, ignore it.
+        if latency > 60 * 1_000_000_000 {
+            return Ok(xdp_action::XDP_PASS);
+        }
+
+        let bucket_index = bpf_log2l(latency);
+        if let Some(bucket) = DIST.get_ptr_mut(bucket_index) {
+            unsafe {
+                *bucket += 1;
+            }
+        } else {
+            error!(&ctx, "DIST.get_ptr_mut failed!");
+            // fallthrough
+        }
     }
 
     Ok(xdp_action::XDP_PASS)
@@ -124,6 +144,14 @@ fn try_probe_tcp_connect(ctx: SockOpsContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
+    // TODO: implement group by comm
+    //match ctx.command() {
+    //    Ok(comm) => {
+    //        let _comm = unsafe { core::str::from_utf8_unchecked(&comm) };
+    //    }
+    //    Err(errno) => debug!(&ctx, "could not get comm, code:{}", errno),
+    //}
+
     let source_addr = u32::from_be(ctx.local_ip4());
     let source_port = ctx.local_port() as u16; // local_port is stored in host byte order.
     let destination_addr = u32::from_be(ctx.remote_ip4());
@@ -141,9 +169,18 @@ fn try_probe_tcp_connect(ctx: SockOpsContext) -> Result<u32, u32> {
         direction: PacketDirection::TX,
     };
 
-    if let Err(_) = TCPHSEVENTS.output(&event, 0) {
-        warn!(&ctx, "ring buffer is full");
-        return Ok(0);
+    let ts = unsafe { bpf_ktime_get_ns() };
+    if let Err(ret) = START.insert(&event.key, &ts, BPF_NOEXIST as u64) {
+        if let Some(start_ts) = unsafe { START.get(&event.key) } {
+            let latency = ts - start_ts;
+            // If SYN packet is older than 2*MSL, replace it.
+            if latency > 60 * 1_000_000_000 {
+                if let Ok(_) = START.insert(&event.key, &ts, 0) {
+                    return Ok(0);
+                }
+            }
+        }
+        warn!(&ctx, "insert to hash failed {}", ret)
     }
 
     Ok(0)
