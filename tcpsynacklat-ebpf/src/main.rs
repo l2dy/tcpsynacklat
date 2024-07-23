@@ -90,7 +90,7 @@ fn try_probe_tcp_synack(ctx: XdpContext) -> Result<u32, ()> {
             return Ok(xdp_action::XDP_PASS);
         }
 
-        let bucket_index = bpf_log2l(latency);
+        let bucket_index = bpf_log2l(latency / 1_000_000); // to milliseconds
         if let Some(bucket) = DIST.get_ptr_mut(bucket_index) {
             unsafe {
                 *bucket += 1;

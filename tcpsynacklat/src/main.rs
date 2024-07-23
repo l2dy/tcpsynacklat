@@ -1,9 +1,12 @@
 use anyhow::Context;
+use aya::maps::{PerCpuArray, PerCpuValues};
 use aya::programs::{SockOps, Xdp, XdpFlags};
 use aya::{include_bytes_aligned, Bpf};
 use aya_log::BpfLogger;
 use clap::Parser;
 use log::{debug, info, warn};
+use tcpsynacklat::print_log2_hist;
+use tcpsynacklat_common::DIST_BUCKET_SIZE;
 use tokio::signal;
 
 #[derive(Debug, Parser)]
@@ -47,19 +50,44 @@ async fn main() -> Result<(), anyhow::Error> {
         // This can happen if you remove all log statements from your eBPF program.
         warn!("failed to initialize eBPF logger: {}", e);
     }
-    let program: &mut Xdp = bpf.program_mut("probe_tcp_synack").unwrap().try_into()?;
-    program.load()?;
-    program.attach(&opt.iface, XdpFlags::default())
+    let xdp_program: &mut Xdp = bpf.program_mut("probe_tcp_synack").unwrap().try_into()?;
+    xdp_program.load()?;
+    let xdp_link = xdp_program.attach(&opt.iface, XdpFlags::default())
            .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
-    let program: &mut SockOps = bpf.program_mut("probe_tcp_connect").unwrap().try_into()?;
+    let sockops_program: &mut SockOps = bpf.program_mut("probe_tcp_connect").unwrap().try_into()?;
     let cgroup = std::fs::File::open(opt.cgroup_path)?;
-    program.load()?;
-    program.attach(cgroup)?;
+    sockops_program.load()?;
+    let sockops_link = sockops_program.attach(cgroup)?;
 
     info!("Waiting for Ctrl-C...");
     signal::ctrl_c().await?;
-    info!("Exiting...");
+
+    // detach programs
+    let sockops_program: &mut SockOps = bpf.program_mut("probe_tcp_connect").unwrap().try_into()?;
+    sockops_program.detach(sockops_link)?;
+    let xdp_program: &mut Xdp = bpf.program_mut("probe_tcp_synack").unwrap().try_into()?;
+    xdp_program.detach(xdp_link)?;
+
+    const DIST_BUCKET_USIZE: usize = DIST_BUCKET_SIZE as usize;
+
+    // print histogram
+    let mut histogram_values: [u64; DIST_BUCKET_USIZE] = [0; DIST_BUCKET_USIZE];
+    let array = PerCpuArray::try_from(bpf.map_mut("DIST").unwrap())?;
+    for bucket_id in 0..DIST_BUCKET_SIZE {
+        let values: PerCpuValues<u64> = array.get(&bucket_id, 0)?;
+
+        let mut val = 0;
+        for cpu_val in values.iter() {
+            val += cpu_val;
+        }
+
+        histogram_values[bucket_id as usize] = val;
+    }
+
+    let mut out_buf = String::default();
+    print_log2_hist(&histogram_values, "latency", &mut out_buf);
+    println!("{}", out_buf);
 
     Ok(())
 }
