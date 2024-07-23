@@ -5,11 +5,13 @@ use aya_ebpf::{
     bindings::{xdp_action, BPF_NOEXIST, BPF_SOCK_OPS_TIMEOUT_INIT, BPF_TCP_SYN_SENT},
     helpers::bpf_ktime_get_ns,
     macros::{map, sock_ops, xdp},
-    maps::{LruHashMap, PerCpuArray},
+    maps::{HashMap, LruHashMap, PerCpuArray},
     programs::{SockOpsContext, XdpContext},
 };
 use aya_log_ebpf::{error, warn};
-use tcpsynacklat_common::{PacketDirection, TcpHandshakeEvent, TcpHandshakeKey, DIST_BUCKET_SIZE};
+use tcpsynacklat_common::{
+    Config, PacketDirection, TcpHandshakeEvent, TcpHandshakeKey, DIST_BUCKET_SIZE,
+};
 use tcpsynacklat_ebpf::bpf_log2l;
 
 use core::mem;
@@ -18,6 +20,9 @@ use network_types::{
     ip::{IpProto, Ipv4Hdr},
     tcp::TcpHdr,
 };
+
+#[map]
+static CONFIG: HashMap<u8, Config> = HashMap::with_max_entries(1, 0);
 
 // value: timestamp in nanoseconds
 #[map]
@@ -64,6 +69,18 @@ fn try_probe_tcp_synack(ctx: XdpContext) -> Result<u32, ()> {
         _ => return Ok(xdp_action::XDP_PASS),
     };
 
+    let config = match unsafe { CONFIG.get(&0) } {
+        Some(c) => c,
+        None => {
+            error!(&ctx, "no config");
+            return Ok(xdp_action::XDP_PASS);
+        }
+    };
+
+    if config.port != 0 && config.port != source_port {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
     let ts = unsafe { bpf_ktime_get_ns() };
 
     let event = TcpHandshakeEvent {
@@ -90,7 +107,14 @@ fn try_probe_tcp_synack(ctx: XdpContext) -> Result<u32, ()> {
             return Ok(xdp_action::XDP_PASS);
         }
 
-        let bucket_index = bpf_log2l(latency / 1_000_000); // to milliseconds
+        // Apply unit conversion
+        let latency = if config.milliseconds_precision {
+            latency / 1_000_000
+        } else {
+            latency / 1_000
+        };
+
+        let bucket_index = bpf_log2l(latency);
         if let Some(bucket) = DIST.get_ptr_mut(bucket_index) {
             unsafe {
                 *bucket += 1;
@@ -144,19 +168,36 @@ fn try_probe_tcp_connect(ctx: SockOpsContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
-    // TODO: implement group by comm
-    //match ctx.command() {
-    //    Ok(comm) => {
-    //        let _comm = unsafe { core::str::from_utf8_unchecked(&comm) };
-    //    }
-    //    Err(errno) => debug!(&ctx, "could not get comm, code:{}", errno),
-    //}
-
     let source_addr = u32::from_be(ctx.local_ip4());
     let source_port = ctx.local_port() as u16; // local_port is stored in host byte order.
     let destination_addr = u32::from_be(ctx.remote_ip4());
     let destination_port = u32::from_be(ctx.remote_port()) as u16;
     let seq = unsafe { (*ctx.ops).snd_nxt };
+
+    let config = match unsafe { CONFIG.get(&0) } {
+        Some(c) => c,
+        None => {
+            error!(&ctx, "no config");
+            return Ok(0);
+        }
+    };
+
+    if config.port != 0 && config.port != destination_port {
+        return Ok(0);
+    }
+
+    // Verifier disallows calling bpf_get_current_comm() in sock_ops program.
+    //
+    // if !config.comm.starts_with(&[0]) {
+    //     match bpf_get_current_comm() {
+    //         Ok(comm) => {
+    //             if comm != config.comm {
+    //                 return Ok(0);
+    //             }
+    //         }
+    //         Err(errno) => debug!(&ctx, "could not get comm, code:{}", errno),
+    //     }
+    // }
 
     let event = TcpHandshakeEvent {
         key: TcpHandshakeKey {

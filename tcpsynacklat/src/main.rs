@@ -1,12 +1,12 @@
 use anyhow::Context;
-use aya::maps::{PerCpuArray, PerCpuValues};
+use aya::maps::{HashMap, PerCpuArray, PerCpuValues};
 use aya::programs::{SockOps, Xdp, XdpFlags};
 use aya::{include_bytes_aligned, Bpf};
 use aya_log::BpfLogger;
 use clap::Parser;
 use log::{debug, info, warn};
 use tcpsynacklat::print_log2_hist;
-use tcpsynacklat_common::DIST_BUCKET_SIZE;
+use tcpsynacklat_common::{Config, DIST_BUCKET_SIZE, TASK_COMM_LEN};
 use tokio::signal;
 
 #[derive(Debug, Parser)]
@@ -15,6 +15,12 @@ struct Opt {
     iface: String,
     #[clap(short, long, default_value = "/sys/fs/cgroup/unified")]
     cgroup_path: String,
+    #[clap(short, long, default_value_t = false)]
+    milliseconds: bool,
+    #[clap(short, long, default_value_t = 0)]
+    port: u16,
+    #[clap(short, long, default_value = "")]
+    comm: String,
 }
 
 #[tokio::main]
@@ -34,6 +40,16 @@ async fn main() -> Result<(), anyhow::Error> {
         debug!("remove limit on locked memory failed, ret is: {}", ret);
     }
 
+    // Prepare config.
+    let mut comm: [u8; TASK_COMM_LEN] = [0; TASK_COMM_LEN];
+    let comm_len = opt.comm.len();
+    comm[..comm_len].clone_from_slice(opt.comm.as_bytes());
+    let new_config = Config {
+        milliseconds_precision: opt.milliseconds,
+        port: opt.port,
+        comm,
+    };
+
     // This will include your eBPF object file as raw bytes at compile-time and load it at
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
@@ -50,6 +66,10 @@ async fn main() -> Result<(), anyhow::Error> {
         // This can happen if you remove all log statements from your eBPF program.
         warn!("failed to initialize eBPF logger: {}", e);
     }
+
+    let mut config = HashMap::try_from(bpf.map_mut("CONFIG").unwrap())?;
+    config.insert(0u8, new_config, 0)?;
+
     let xdp_program: &mut Xdp = bpf.program_mut("probe_tcp_synack").unwrap().try_into()?;
     xdp_program.load()?;
     let xdp_link = xdp_program.attach(&opt.iface, XdpFlags::default())
