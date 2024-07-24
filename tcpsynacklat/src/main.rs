@@ -19,7 +19,7 @@ struct Opt {
     milliseconds: bool,
     #[clap(short, long, default_value_t = 0)]
     port: u16,
-    #[clap(short, long, default_value = "")]
+    #[clap(long, default_value = "")]
     comm: String,
 }
 
