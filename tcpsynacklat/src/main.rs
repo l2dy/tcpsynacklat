@@ -106,7 +106,8 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let mut out_buf = String::default();
-    print_log2_hist(&histogram_values, "latency", &mut out_buf);
+    let hist_label = if opt.milliseconds { "msecs" } else { "usecs" };
+    print_log2_hist(&histogram_values, hist_label, &mut out_buf);
     println!("{}", out_buf);
 
     Ok(())
